@@ -31,6 +31,8 @@ const (
 	EnvDatabaseName        = "DB_NAME"
 	EnvDatabaseNameDefault = "postgres"
 
+	EnvMigrationsEnabled = "DB_MIGRATIONS_ENABLED"
+
 	EnvChangelogSchema        = "DB_CHANGELOG_SCHEMA"
 	EnvChangelogSchemaDefault = "public"
 
@@ -51,6 +53,7 @@ type Configuration struct {
 	Password string
 	Name     string
 
+	MigrationsEnabled   bool
 	ChangelogSchema     string
 	ChangelogTable      string
 	MigrationsDirectory string
@@ -74,6 +77,11 @@ func CreateConfigurationFromEnv() Configuration {
 		name = EnvDatabaseNameDefault
 	}
 
+	migrationsEnabled, err := strconv.ParseBool(os.Getenv(EnvMigrationsEnabled))
+	if err != nil {
+		migrationsEnabled = false
+	}
+
 	changelogSchema := os.Getenv(EnvChangelogSchema)
 	if changelogSchema == "" {
 		changelogSchema = EnvChangelogSchemaDefault
@@ -91,6 +99,7 @@ func CreateConfigurationFromEnv() Configuration {
 		Username:            username,
 		Password:            password,
 		Name:                name,
+		MigrationsEnabled:   migrationsEnabled,
 		ChangelogSchema:     changelogSchema,
 		ChangelogTable:      changelogTable,
 		MigrationsDirectory: migrationsDirectory,
@@ -116,10 +125,12 @@ func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	dm := createDatabaseMigrator(pool, c)
-	err = dm.Migrate()
-	if err != nil {
-		return nil, err
+	if c.MigrationsEnabled {
+		dm := createDatabaseMigrator(pool, c)
+		err = dm.Migrate()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return pool, nil
 }

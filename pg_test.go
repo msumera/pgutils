@@ -39,6 +39,7 @@ func TestConnect(t *testing.T) {
 	t.Setenv(EnvDatabasePassword, "test_password")
 	t.Setenv(EnvDatabaseName, "test_db")
 	t.Setenv(EnvMigrationsDirectory, "testdb")
+	t.Setenv(EnvMigrationsEnabled, "true")
 	pool, err := Connect()
 	if err != nil {
 		t.Error(err)
