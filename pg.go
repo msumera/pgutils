@@ -172,7 +172,7 @@ func (dbm *databaseMigrator) Migrate() error {
 			panic(p)
 		}
 	}()
-	_, err = tx.Exec(context.Background(), dbm.replaceEnv("LOCK TABLE SCHEMA_TABLE IN ACCESS EXCLUSIVE MODE"))
+	_, err = tx.Exec(context.Background(), dbm.replaceEnv("LOCK TABLE {SCHEMA_TABLE} IN ACCESS EXCLUSIVE MODE"))
 	if err != nil {
 		return err
 	}
@@ -238,7 +238,7 @@ func (dbm *databaseMigrator) applyMigration(migration migration, tx pgx.Tx) erro
 
 func (dbm *databaseMigrator) getMigrationStatus(id string, tx pgx.Tx) (migrationStatus, error) {
 	//goland:noinspection SqlResolve
-	query := dbm.replaceEnv("SELECT status FROM SCHEMA_TABLE WHERE id = $1 FOR UPDATE")
+	query := dbm.replaceEnv("SELECT status FROM {SCHEMA_TABLE} WHERE id = $1 FOR UPDATE")
 	row := tx.QueryRow(context.Background(), query, id)
 	var migrationStatus migrationStatus
 	err := row.Scan(&migrationStatus)
@@ -253,7 +253,7 @@ func (dbm *databaseMigrator) getMigrationStatus(id string, tx pgx.Tx) (migration
 
 func (dbm *databaseMigrator) updateMigrationStatus(id string, migration migration, status migrationStatus, tx pgx.Tx) error {
 	//goland:noinspection SqlResolve
-	insert := dbm.replaceEnv("INSERT INTO SCHEMA_TABLE (id, name, filename, status, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET status = $4, timestamp = $5")
+	insert := dbm.replaceEnv("INSERT INTO {SCHEMA_TABLE} (id, name, filename, status, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET status = $4, timestamp = $5")
 	_, err := tx.Exec(context.Background(), insert, id, migration.Name, migration.Filename, status, time.Now())
 	if err != nil {
 		log.Printf("Error inserting migration info %v: %v", migration.Filename, err)
@@ -360,7 +360,8 @@ func (dbm *databaseMigrator) createChangelogTable() error {
 		}
 	}()
 	script := `
-		CREATE TABLE SCHEMA_TABLE
+ 		CREATE SCHEMA IF NOT EXISTS {SCHEMA};
+		CREATE TABLE IF NOT EXISTS {SCHEMA_TABLE}
 		(
 			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
@@ -381,7 +382,9 @@ func (dbm *databaseMigrator) createChangelogTable() error {
 }
 
 func (dbm *databaseMigrator) replaceEnv(s string) string {
-	return strings.ReplaceAll(s, "SCHEMA_TABLE", dbm.Configuration.schemaTable())
+	s = strings.ReplaceAll(s, "{SCHEMA_TABLE}", dbm.Configuration.schemaTable())
+	s = strings.ReplaceAll(s, "{SCHEMA}", dbm.Configuration.ChangelogSchema)
+	return s
 }
 
 func DoInTransaction[R any](pool *pgxpool.Pool, fn func(tx pgx.Tx) (*R, error)) (*R, error) {
