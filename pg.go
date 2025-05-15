@@ -17,6 +17,7 @@ import (
 )
 
 type migrationStatus = string
+type SslMode = string
 
 const (
 	EnvDatabaseAddress        = "DB_ADDRESS"
@@ -31,7 +32,26 @@ const (
 	EnvDatabaseName        = "DB_NAME"
 	EnvDatabaseNameDefault = "postgres"
 
-	EnvMigrationsEnabled = "DB_MIGRATIONS_ENABLED"
+	EnvDatabaseSchema        = "DB_SCHEMA"
+	EnvDatabaseSchemaDefault = ""
+
+	EnvDatabaseMigrationSchema        = "DB_MIGRATION_SCHEMA"
+	EnvDatabaseMigrationSchemaDefault = ""
+
+	EnvDatabaseSslMode        = "DB_SSL_MODE"
+	EnvDatabaseSslModeDefault = SslModeDisable
+
+	EnvDatabaseSslRootCert        = "DB_SSL_ROOT_CERT"
+	EnvDatabaseSslRootCertDefault = ""
+
+	EnvDatabaseSslCert        = "DB_SSL_CERT"
+	EnvDatabaseSslCertDefault = ""
+
+	EnvDatabaseSslKey        = "DB_SSL_KEY"
+	EnvDatabaseSslKeyDefault = ""
+
+	EnvMigrationsEnabled        = "DB_MIGRATIONS_ENABLED"
+	EnvMigrationsEnabledDefault = true
 
 	EnvChangelogSchema        = "DB_CHANGELOG_SCHEMA"
 	EnvChangelogSchemaDefault = "public"
@@ -45,13 +65,26 @@ const (
 	statusCompleted migrationStatus = "COMPLETED"
 	statusError     migrationStatus = "ERROR"
 	statusNew       migrationStatus = "NEW"
+
+	SslModeDisable    SslMode = "disable"
+	SslModeRequire    SslMode = "require"
+	SslModeVerifyFull SslMode = "verify-full"
+	SslModeVerifyCA   SslMode = "verify-ca"
+	SslModePrefer     SslMode = "prefer"
+	SslModeAllow      SslMode = "allow"
 )
 
 type Configuration struct {
-	Address  string
-	Username string
-	Password string
-	Name     string
+	Address         string
+	Username        string
+	Password        string
+	Name            string
+	Schema          string
+	MigrationSchema string
+	SslMode         SslMode
+	SslRootCert     string
+	SslCert         string
+	SslKey          string
 
 	MigrationsEnabled   bool
 	ChangelogSchema     string
@@ -76,10 +109,34 @@ func CreateConfigurationFromEnv() Configuration {
 	if name == "" {
 		name = EnvDatabaseNameDefault
 	}
+	schema := os.Getenv(EnvDatabaseSchema)
+	if schema == "" {
+		schema = EnvDatabaseSchemaDefault
+	}
+	migrationSchema := os.Getenv(EnvDatabaseMigrationSchema)
+	if migrationSchema == "" {
+		migrationSchema = EnvDatabaseMigrationSchemaDefault
+	}
+	sslMode := os.Getenv(EnvDatabaseSslMode)
+	if sslMode == "" {
+		sslMode = EnvDatabaseSslModeDefault
+	}
+	sslRootCert := os.Getenv(EnvDatabaseSslRootCert)
+	if sslRootCert == "" {
+		sslRootCert = EnvDatabaseSslRootCertDefault
+	}
+	sslCert := os.Getenv(EnvDatabaseSslCert)
+	if sslCert == "" {
+		sslCert = EnvDatabaseSslCertDefault
+	}
+	sslKey := os.Getenv(EnvDatabaseSslKey)
+	if sslKey == "" {
+		sslKey = EnvDatabaseSslKeyDefault
+	}
 
 	migrationsEnabled, err := strconv.ParseBool(os.Getenv(EnvMigrationsEnabled))
 	if err != nil {
-		migrationsEnabled = false
+		migrationsEnabled = EnvMigrationsEnabledDefault
 	}
 
 	changelogSchema := os.Getenv(EnvChangelogSchema)
@@ -99,6 +156,12 @@ func CreateConfigurationFromEnv() Configuration {
 		Username:            username,
 		Password:            password,
 		Name:                name,
+		Schema:              schema,
+		MigrationSchema:     migrationSchema,
+		SslMode:             sslMode,
+		SslRootCert:         sslRootCert,
+		SslCert:             sslCert,
+		SslKey:              sslKey,
 		MigrationsEnabled:   migrationsEnabled,
 		ChangelogSchema:     changelogSchema,
 		ChangelogTable:      changelogTable,
@@ -107,6 +170,9 @@ func CreateConfigurationFromEnv() Configuration {
 }
 
 func (c Configuration) schemaTable() string {
+	if c.ChangelogSchema == "" {
+		return c.ChangelogTable
+	}
 	return c.ChangelogSchema + "." + c.ChangelogTable
 }
 
@@ -116,7 +182,16 @@ func Connect() (*pgxpool.Pool, error) {
 }
 
 func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
-	url := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", c.Username, c.Password, c.Address, c.Name)
+	url := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", c.Username, c.Password, c.Address, c.Name, c.SslMode)
+	if c.SslRootCert != "" {
+		url += "&sslrootcert=" + c.SslRootCert
+	}
+	if c.SslCert != "" {
+		url += "&sslcert=" + c.SslCert
+	}
+	if c.SslKey != "" {
+		url += "&sslkey=" + c.SslKey
+	}
 	config, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
@@ -128,6 +203,12 @@ func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
 	if c.MigrationsEnabled {
 		dm := createDatabaseMigrator(pool, c)
 		err = dm.Migrate()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if c.Schema != "" {
+		_, err := pool.Exec(context.Background(), "SET search_path TO "+c.Schema)
 		if err != nil {
 			return nil, err
 		}
@@ -175,6 +256,22 @@ func (dbm *databaseMigrator) Migrate() error {
 	_, err = tx.Exec(context.Background(), dbm.replaceEnv("LOCK TABLE {SCHEMA_TABLE} IN ACCESS EXCLUSIVE MODE"))
 	if err != nil {
 		return err
+	}
+	if dbm.Configuration.MigrationSchema != "" {
+		exists, err := dbm.schemaExists(dbm.Configuration.MigrationSchema)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			err = dbm.createSchema(dbm.Configuration.MigrationSchema)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(context.Background(), "SET search_path TO "+dbm.Configuration.MigrationSchema)
+		if err != nil {
+			return err
+		}
 	}
 	for _, migration := range migrations {
 		err = dbm.applyMigration(migration, tx)
@@ -336,6 +433,17 @@ func (dbm *databaseMigrator) initChangelogTable() error {
 	return nil
 }
 
+func (dbm *databaseMigrator) schemaExists(schema string) (bool, error) {
+	querySql := "SELECT EXISTS (SELECT FROM information_schema.schemata WHERE schemata.schema_name = $1)"
+	row := dbm.PgxPool.QueryRow(context.Background(), querySql, schema)
+	var exists bool
+	err := row.Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (dbm *databaseMigrator) tableExists(schema string, table string) (bool, error) {
 	//goland:noinspection SqlResolve
 	querySql := "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = $1 AND tablename = $2)"
@@ -346,6 +454,14 @@ func (dbm *databaseMigrator) tableExists(schema string, table string) (bool, err
 		return false, err
 	}
 	return exists, nil
+}
+
+func (dbm *databaseMigrator) createSchema(schema string) error {
+	_, err := dbm.PgxPool.Exec(context.Background(), "CREATE SCHEMA IF NOT EXISTS "+schema)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (dbm *databaseMigrator) createChangelogTable() error {
