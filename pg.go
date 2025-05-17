@@ -196,6 +196,9 @@ func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.Schema != "" {
+		config.ConnConfig.RuntimeParams["search_path"] = c.Schema
+	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		return nil, err
@@ -203,12 +206,6 @@ func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
 	if c.MigrationsEnabled {
 		dm := createDatabaseMigrator(pool, c)
 		err = dm.Migrate()
-		if err != nil {
-			return nil, err
-		}
-	}
-	if c.Schema != "" {
-		_, err := pool.Exec(context.Background(), "SET search_path TO "+c.Schema)
 		if err != nil {
 			return nil, err
 		}
