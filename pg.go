@@ -4,20 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	log "github.com/sirupsen/logrus"
-	"io"
 	"io/fs"
+	"log/slog"
+	"net/url"
 	"os"
-	"sort"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type migrationStatus = string
-type SslMode = string
+// MigrationStatus represents the status of a database migration.
+type MigrationStatus string
+
+// SSLMode represents PostgreSQL SSL connection mode.
+type SSLMode string
+type SslMode = SSLMode
 
 const (
 	EnvDatabaseAddress        = "DB_ADDRESS"
@@ -39,7 +45,7 @@ const (
 	EnvDatabaseMigrationSchemaDefault = ""
 
 	EnvDatabaseSslMode        = "DB_SSL_MODE"
-	EnvDatabaseSslModeDefault = SslModeDisable
+	EnvDatabaseSslModeDefault = SSLModeDisable
 
 	EnvDatabaseSslRootCert        = "DB_SSL_ROOT_CERT"
 	EnvDatabaseSslRootCertDefault = ""
@@ -62,18 +68,30 @@ const (
 	EnvMigrationsDirectory        = "DB_MIGRATIONS_DIRECTORY"
 	EnvMigrationsDirectoryDefault = "db"
 
-	statusCompleted migrationStatus = "COMPLETED"
-	statusError     migrationStatus = "ERROR"
-	statusNew       migrationStatus = "NEW"
+	StatusCompleted MigrationStatus = "COMPLETED"
+	StatusError     MigrationStatus = "ERROR"
+	StatusNew       MigrationStatus = "NEW"
 
-	SslModeDisable    SslMode = "disable"
-	SslModeRequire    SslMode = "require"
-	SslModeVerifyFull SslMode = "verify-full"
-	SslModeVerifyCA   SslMode = "verify-ca"
-	SslModePrefer     SslMode = "prefer"
-	SslModeAllow      SslMode = "allow"
+	statusCompleted = StatusCompleted
+	statusError     = StatusError
+	statusNew       = StatusNew
+
+	SSLModeDisable    SSLMode = "disable"
+	SSLModeRequire    SSLMode = "require"
+	SSLModeVerifyFull SSLMode = "verify-full"
+	SSLModeVerifyCA   SSLMode = "verify-ca"
+	SSLModePrefer     SSLMode = "prefer"
+	SSLModeAllow      SSLMode = "allow"
+
+	SslModeDisable    = SSLModeDisable
+	SslModeRequire    = SSLModeRequire
+	SslModeVerifyFull = SSLModeVerifyFull
+	SslModeVerifyCA   = SSLModeVerifyCA
+	SslModePrefer     = SSLModePrefer
+	SslModeAllow      = SSLModeAllow
 )
 
+// Configuration holds the PostgreSQL connection and migration settings.
 type Configuration struct {
 	Address         string
 	Username        string
@@ -81,7 +99,7 @@ type Configuration struct {
 	Name            string
 	Schema          string
 	MigrationSchema string
-	SslMode         SslMode
+	SslMode         SSLMode
 	SslRootCert     string
 	SslCert         string
 	SslKey          string
@@ -92,122 +110,107 @@ type Configuration struct {
 	MigrationsDirectory string
 }
 
+// CreateConfigurationFromEnv creates a Configuration by reading environment variables
+// or falling back to default values.
 func CreateConfigurationFromEnv() Configuration {
-	address := os.Getenv(EnvDatabaseAddress)
-	if address == "" {
-		address = EnvDatabaseAddressDefault
-	}
-	username := os.Getenv(EnvDatabaseUsername)
-	if username == "" {
-		username = EnvDatabaseUsernameDefault
-	}
-	password := os.Getenv(EnvDatabasePassword)
-	if password == "" {
-		password = EnvDatabasePasswordDefault
-	}
-	name := os.Getenv(EnvDatabaseName)
-	if name == "" {
-		name = EnvDatabaseNameDefault
-	}
-	schema := os.Getenv(EnvDatabaseSchema)
-	if schema == "" {
-		schema = EnvDatabaseSchemaDefault
-	}
-	migrationSchema := os.Getenv(EnvDatabaseMigrationSchema)
-	if migrationSchema == "" {
-		migrationSchema = EnvDatabaseMigrationSchemaDefault
-	}
-	sslMode := os.Getenv(EnvDatabaseSslMode)
-	if sslMode == "" {
-		sslMode = EnvDatabaseSslModeDefault
-	}
-	sslRootCert := os.Getenv(EnvDatabaseSslRootCert)
-	if sslRootCert == "" {
-		sslRootCert = EnvDatabaseSslRootCertDefault
-	}
-	sslCert := os.Getenv(EnvDatabaseSslCert)
-	if sslCert == "" {
-		sslCert = EnvDatabaseSslCertDefault
-	}
-	sslKey := os.Getenv(EnvDatabaseSslKey)
-	if sslKey == "" {
-		sslKey = EnvDatabaseSslKeyDefault
+	getEnv := func(key, def string) string {
+		if val, ok := os.LookupEnv(key); ok && val != "" {
+			return val
+		}
+		return def
 	}
 
-	migrationsEnabled, err := strconv.ParseBool(os.Getenv(EnvMigrationsEnabled))
-	if err != nil {
-		migrationsEnabled = EnvMigrationsEnabledDefault
+	migrationsEnabled := EnvMigrationsEnabledDefault
+	if val, ok := os.LookupEnv(EnvMigrationsEnabled); ok {
+		if parsed, err := strconv.ParseBool(val); err == nil {
+			migrationsEnabled = parsed
+		}
 	}
 
-	changelogSchema := os.Getenv(EnvChangelogSchema)
-	if changelogSchema == "" {
-		changelogSchema = EnvChangelogSchemaDefault
-	}
-	changelogTable := os.Getenv(EnvChangelogTable)
-	if changelogTable == "" {
-		changelogTable = EnvChangelogTableDefault
-	}
-	migrationsDirectory := os.Getenv(EnvMigrationsDirectory)
-	if migrationsDirectory == "" {
-		migrationsDirectory = EnvMigrationsDirectoryDefault
-	}
 	return Configuration{
-		Address:             address,
-		Username:            username,
-		Password:            password,
-		Name:                name,
-		Schema:              schema,
-		MigrationSchema:     migrationSchema,
-		SslMode:             sslMode,
-		SslRootCert:         sslRootCert,
-		SslCert:             sslCert,
-		SslKey:              sslKey,
+		Address:             getEnv(EnvDatabaseAddress, EnvDatabaseAddressDefault),
+		Username:            getEnv(EnvDatabaseUsername, EnvDatabaseUsernameDefault),
+		Password:            getEnv(EnvDatabasePassword, EnvDatabasePasswordDefault),
+		Name:                getEnv(EnvDatabaseName, EnvDatabaseNameDefault),
+		Schema:              getEnv(EnvDatabaseSchema, EnvDatabaseSchemaDefault),
+		MigrationSchema:     getEnv(EnvDatabaseMigrationSchema, EnvDatabaseMigrationSchemaDefault),
+		SslMode:             SSLMode(getEnv(EnvDatabaseSslMode, string(EnvDatabaseSslModeDefault))),
+		SslRootCert:         getEnv(EnvDatabaseSslRootCert, EnvDatabaseSslRootCertDefault),
+		SslCert:             getEnv(EnvDatabaseSslCert, EnvDatabaseSslCertDefault),
+		SslKey:              getEnv(EnvDatabaseSslKey, EnvDatabaseSslKeyDefault),
 		MigrationsEnabled:   migrationsEnabled,
-		ChangelogSchema:     changelogSchema,
-		ChangelogTable:      changelogTable,
-		MigrationsDirectory: migrationsDirectory,
+		ChangelogSchema:     getEnv(EnvChangelogSchema, EnvChangelogSchemaDefault),
+		ChangelogTable:      getEnv(EnvChangelogTable, EnvChangelogTableDefault),
+		MigrationsDirectory: getEnv(EnvMigrationsDirectory, EnvMigrationsDirectoryDefault),
 	}
 }
 
 func (c Configuration) schemaTable() string {
 	if c.ChangelogSchema == "" {
-		return c.ChangelogTable
+		return pgx.Identifier{c.ChangelogTable}.Sanitize()
 	}
-	return c.ChangelogSchema + "." + c.ChangelogTable
+	return pgx.Identifier{c.ChangelogSchema, c.ChangelogTable}.Sanitize()
 }
 
+// Connect creates a connection pool from environment variables.
 func Connect() (*pgxpool.Pool, error) {
-	c := CreateConfigurationFromEnv()
-	return ConnectWithConfig(c)
+	return ConnectContext(context.Background())
 }
 
+// ConnectContext creates a connection pool from environment variables with the given context.
+func ConnectContext(ctx context.Context) (*pgxpool.Pool, error) {
+	return ConnectWithConfigContext(ctx, CreateConfigurationFromEnv())
+}
+
+// ConnectWithConfig creates a connection pool using the provided Configuration.
 func ConnectWithConfig(c Configuration) (*pgxpool.Pool, error) {
-	url := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", c.Username, c.Password, c.Address, c.Name, c.SslMode)
+	return ConnectWithConfigContext(context.Background(), c)
+}
+
+// ConnectWithConfigContext creates a connection pool using the provided Configuration and context.
+func ConnectWithConfigContext(ctx context.Context, c Configuration) (*pgxpool.Pool, error) {
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(c.Username, c.Password),
+		Host:   c.Address,
+		Path:   c.Name,
+	}
+
+	q := url.Values{}
+	if c.SslMode != "" {
+		q.Set("sslmode", string(c.SslMode))
+	}
 	if c.SslRootCert != "" {
-		url += "&sslrootcert=" + c.SslRootCert
+		q.Set("sslrootcert", c.SslRootCert)
 	}
 	if c.SslCert != "" {
-		url += "&sslcert=" + c.SslCert
+		q.Set("sslcert", c.SslCert)
 	}
 	if c.SslKey != "" {
-		url += "&sslkey=" + c.SslKey
+		q.Set("sslkey", c.SslKey)
 	}
-	config, err := pgxpool.ParseConfig(url)
+	if len(q) > 0 {
+		u.RawQuery = q.Encode()
+	}
+
+	config, err := pgxpool.ParseConfig(u.String())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse connection config: %w", err)
 	}
 	if c.Schema != "" {
 		config.ConnConfig.RuntimeParams["search_path"] = c.Schema
 	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create connection pool: %w", err)
 	}
+
 	if c.MigrationsEnabled {
 		dm := createDatabaseMigrator(pool, c)
-		err = dm.Migrate()
-		if err != nil {
-			return nil, err
+		if err := dm.Migrate(ctx); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("migration failed: %w", err)
 		}
 	}
 	return pool, nil
@@ -226,131 +229,126 @@ func createDatabaseMigrator(pgxPool *pgxpool.Pool, config Configuration) *databa
 }
 
 type migration struct {
-	Id       []int
+	ID       []int
 	Name     string
 	Filename string
 }
 
-func (dbm *databaseMigrator) Migrate() error {
-	err := dbm.initChangelogTable()
-	if err != nil {
-		return err
+func (dbm *databaseMigrator) Migrate(ctx context.Context) error {
+	if err := dbm.initChangelogTable(ctx); err != nil {
+		return fmt.Errorf("failed to init changelog table: %w", err)
 	}
 	migrations, err := dbm.getMigrations()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to retrieve migrations: %w", err)
 	}
-	tx, err := dbm.PgxPool.Begin(context.Background())
+	if len(migrations) == 0 {
+		return nil
+	}
+
+	tx, err := dbm.PgxPool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to begin migration transaction: %w", err)
 	}
 	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback(context.Background())
-			panic(p)
-		}
+		_ = tx.Rollback(ctx)
 	}()
-	_, err = tx.Exec(context.Background(), dbm.replaceEnv("LOCK TABLE {SCHEMA_TABLE} IN ACCESS EXCLUSIVE MODE"))
-	if err != nil {
-		return err
+
+	lockQuery := fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE", dbm.Configuration.schemaTable())
+	if _, err := tx.Exec(ctx, lockQuery); err != nil {
+		return fmt.Errorf("failed to lock changelog table: %w", err)
 	}
+
 	if dbm.Configuration.MigrationSchema != "" {
-		exists, err := dbm.schemaExists(dbm.Configuration.MigrationSchema)
+		exists, err := dbm.schemaExists(ctx, dbm.Configuration.MigrationSchema)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to check migration schema: %w", err)
 		}
 		if !exists {
-			err = dbm.createSchema(dbm.Configuration.MigrationSchema)
-			if err != nil {
-				return err
+			if err := dbm.createSchema(ctx, dbm.Configuration.MigrationSchema); err != nil {
+				return fmt.Errorf("failed to create migration schema: %w", err)
 			}
 		}
-		_, err = tx.Exec(context.Background(), "SET search_path TO "+dbm.Configuration.MigrationSchema)
-		if err != nil {
+		schemaIdent := pgx.Identifier{dbm.Configuration.MigrationSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, "SET search_path TO "+schemaIdent); err != nil {
+			return fmt.Errorf("failed to set search_path to migration schema: %w", err)
+		}
+	}
+
+	for _, m := range migrations {
+		if err := dbm.applyMigration(ctx, m, tx); err != nil {
 			return err
 		}
 	}
-	for _, migration := range migrations {
-		err = dbm.applyMigration(migration, tx)
-		if err != nil {
-			return err
-		}
-	}
-	err = tx.Commit(context.Background())
-	if err != nil {
-		return err
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit migrations: %w", err)
 	}
 	return nil
 }
 
-func Map[T, R any](list []T, fn func(T) R) []R {
-	result := make([]R, 0, len(list))
-	for _, t := range list {
-		result = append(result, fn(t))
+func formatMigrationID(id []int) string {
+	parts := make([]string, len(id))
+	for i, v := range id {
+		parts[i] = strconv.Itoa(v)
 	}
-	return result
+	return strings.Join(parts, ".")
 }
 
-func (dbm *databaseMigrator) applyMigration(migration migration, tx pgx.Tx) error {
-	log.Printf("Applying migration %v", migration.Filename)
-	id := strings.Join(Map(migration.Id, strconv.Itoa), ".")
-	status, err := dbm.getMigrationStatus(id, tx)
+func (dbm *databaseMigrator) applyMigration(ctx context.Context, m migration, tx pgx.Tx) error {
+	slog.Info("Applying migration", "filename", m.Filename)
+	id := formatMigrationID(m.ID)
+	status, err := dbm.getMigrationStatus(ctx, id, tx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get migration status for %s: %w", m.Filename, err)
 	}
-	if status == statusCompleted {
-		log.Printf("Migration %v already applied", migration.Filename)
+	if status == StatusCompleted {
+		slog.Info("Migration already applied", "filename", m.Filename)
 		return nil
 	}
-	scriptFile, err := os.Open(dbm.Configuration.MigrationsDirectory + string(os.PathSeparator) + migration.Filename)
+
+	filePath := filepath.Join(dbm.Configuration.MigrationsDirectory, m.Filename)
+	bytes, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Printf("Error opening migration file %v: %v", migration.Filename, err)
-		return err
+		slog.Error("Error reading migration file", "filename", m.Filename, "error", err)
+		return fmt.Errorf("failed to read migration file %s: %w", m.Filename, err)
 	}
-	defer func(scriptFile *os.File) {
-		_ = scriptFile.Close()
-	}(scriptFile)
-	bytes, err := io.ReadAll(scriptFile)
-	if err != nil {
-		log.Printf("Error reading migration file %v: %v", migration.Filename, err)
-		return err
-	}
+
 	script := string(bytes)
-	_, migrationError := tx.Exec(context.Background(), script)
-	if migrationError != nil {
-		status = statusError
-	} else {
-		status = statusCompleted
+	if _, err := tx.Exec(ctx, script); err != nil {
+		slog.Error("Failed to apply migration script", "filename", m.Filename, "error", err)
+		return fmt.Errorf("failed to execute migration %s: %w", m.Filename, err)
 	}
-	log.Printf("Migration status: %v", status)
-	err = dbm.updateMigrationStatus(id, migration, status, tx)
-	if err != nil {
-		return err
+
+	slog.Info("Migration status", "filename", m.Filename, "status", StatusCompleted)
+	if err := dbm.updateMigrationStatus(ctx, id, m, StatusCompleted, tx); err != nil {
+		return fmt.Errorf("failed to update migration status for %s: %w", m.Filename, err)
 	}
-	return migrationError
+	return nil
 }
 
-func (dbm *databaseMigrator) getMigrationStatus(id string, tx pgx.Tx) (migrationStatus, error) {
-	//goland:noinspection SqlResolve
-	query := dbm.replaceEnv("SELECT status FROM {SCHEMA_TABLE} WHERE id = $1 FOR UPDATE")
-	row := tx.QueryRow(context.Background(), query, id)
-	var migrationStatus migrationStatus
-	err := row.Scan(&migrationStatus)
+func (dbm *databaseMigrator) getMigrationStatus(ctx context.Context, id string, tx pgx.Tx) (MigrationStatus, error) {
+	query := fmt.Sprintf("SELECT status FROM %s WHERE id = $1 FOR UPDATE", dbm.Configuration.schemaTable())
+	row := tx.QueryRow(ctx, query, id)
+	var status MigrationStatus
+	err := row.Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return statusNew, nil
+		return StatusNew, nil
 	}
 	if err != nil {
 		return "", err
 	}
-	return migrationStatus, nil
+	return status, nil
 }
 
-func (dbm *databaseMigrator) updateMigrationStatus(id string, migration migration, status migrationStatus, tx pgx.Tx) error {
-	//goland:noinspection SqlResolve
-	insert := dbm.replaceEnv("INSERT INTO {SCHEMA_TABLE} (id, name, filename, status, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET status = $4, timestamp = $5")
-	_, err := tx.Exec(context.Background(), insert, id, migration.Name, migration.Filename, status, time.Now())
+func (dbm *databaseMigrator) updateMigrationStatus(ctx context.Context, id string, m migration, status MigrationStatus, tx pgx.Tx) error {
+	query := fmt.Sprintf(
+		"INSERT INTO %s (id, name, filename, status, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET status = $4, timestamp = $5",
+		dbm.Configuration.schemaTable(),
+	)
+	_, err := tx.Exec(ctx, query, id, m.Name, m.Filename, string(status), time.Now())
 	if err != nil {
-		log.Printf("Error inserting migration info %v: %v", migration.Filename, err)
+		slog.Error("Error inserting migration info", "filename", m.Filename, "error", err)
 		return err
 	}
 	return nil
@@ -360,180 +358,191 @@ func (dbm *databaseMigrator) getMigrations() ([]migration, error) {
 	migrationsDir := dbm.Configuration.MigrationsDirectory
 	entries, err := os.ReadDir(migrationsDir)
 	if errors.Is(err, fs.ErrNotExist) {
-		log.Warnf("Directory %v does not exist", dbm.Configuration.MigrationsDirectory)
-		return make([]migration, 0), nil
+		slog.Warn("Directory does not exist", "directory", dbm.Configuration.MigrationsDirectory)
+		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read migrations directory %s: %w", migrationsDir, err)
 	}
-	migrations := make([]migration, 0)
-	for i := range entries {
-		entry := entries[i]
-		if !entry.IsDir() {
-			if strings.HasSuffix(entry.Name(), ".sql") {
-				parts := strings.Split(entry.Name(), "_")
-				ids := make([]int, 0)
-				for _, part := range parts {
-					v, err := strconv.Atoi(part)
-					if err == nil {
-						ids = append(ids, v)
-					} else {
-						break
-					}
-				}
-				names := make([]string, 0)
-				for i := 0; i < len(parts)-len(ids); i++ {
-					names = append(names, parts[i+len(ids)])
-				}
-				name := strings.TrimSuffix(strings.Join(names, " "), ".sql")
-				migration := migration{
-					Id:       ids,
-					Name:     name,
-					Filename: entry.Name(),
-				}
-				migrations = append(migrations, migration)
-			}
+
+	var migrations []migration
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
 		}
+
+		parts := strings.Split(entry.Name(), "_")
+		var ids []int
+		for _, part := range parts {
+			v, err := strconv.Atoi(part)
+			if err != nil {
+				break
+			}
+			ids = append(ids, v)
+		}
+
+		// Files without numeric version prefix are ignored per documentation
+		if len(ids) == 0 {
+			slog.Warn("Ignoring migration file without numeric prefix", "filename", entry.Name())
+			continue
+		}
+
+		names := parts[len(ids):]
+		name := strings.TrimSuffix(strings.Join(names, " "), ".sql")
+		migrations = append(migrations, migration{
+			ID:       ids,
+			Name:     name,
+			Filename: entry.Name(),
+		})
 	}
-	sort.Slice(migrations, func(i, j int) bool {
-		m1 := migrations[i].Id
-		m2 := migrations[j].Id
-		for i := 0; i < min(len(m1), len(m2)); i++ {
-			i1 := m1[i]
-			i2 := m2[i]
-			if i1 < i2 {
-				return true
+
+	slices.SortFunc(migrations, func(m1, m2 migration) int {
+		minLen := min(len(m1.ID), len(m2.ID))
+		for i := 0; i < minLen; i++ {
+			if m1.ID[i] < m2.ID[i] {
+				return -1
 			}
-			if i1 > i2 {
-				return false
+			if m1.ID[i] > m2.ID[i] {
+				return 1
 			}
 		}
-		if len(m1) < len(m2) {
-			return true
+		if len(m1.ID) < len(m2.ID) {
+			return -1
 		}
-		return false
+		if len(m1.ID) > len(m2.ID) {
+			return 1
+		}
+		// Tie-breaker: compare filenames alphabetically
+		return strings.Compare(m1.Filename, m2.Filename)
 	})
+
 	return migrations, nil
 }
 
-func (dbm *databaseMigrator) initChangelogTable() error {
-	exists, err := dbm.tableExists(dbm.Configuration.ChangelogSchema, dbm.Configuration.ChangelogTable)
+func (dbm *databaseMigrator) initChangelogTable(ctx context.Context) error {
+	exists, err := dbm.tableExists(ctx, dbm.Configuration.ChangelogSchema, dbm.Configuration.ChangelogTable)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		err = dbm.createChangelogTable()
-		if err != nil {
+		if err := dbm.createChangelogTable(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (dbm *databaseMigrator) schemaExists(schema string) (bool, error) {
-	querySql := "SELECT EXISTS (SELECT FROM information_schema.schemata WHERE schemata.schema_name = $1)"
-	row := dbm.PgxPool.QueryRow(context.Background(), querySql, schema)
+func (dbm *databaseMigrator) schemaExists(ctx context.Context, schema string) (bool, error) {
+	querySQL := "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)"
+	row := dbm.PgxPool.QueryRow(ctx, querySQL, schema)
 	var exists bool
-	err := row.Scan(&exists)
-	if err != nil {
-		return false, err
+	if err := row.Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check if schema exists: %w", err)
 	}
 	return exists, nil
 }
 
-func (dbm *databaseMigrator) tableExists(schema string, table string) (bool, error) {
-	//goland:noinspection SqlResolve
-	querySql := "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = $1 AND tablename = $2)"
-	row := dbm.PgxPool.QueryRow(context.Background(), querySql, schema, table)
+func (dbm *databaseMigrator) tableExists(ctx context.Context, schema string, table string) (bool, error) {
+	var querySQL string
+	var row pgx.Row
+	if schema != "" {
+		querySQL = "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = $1 AND tablename = $2)"
+		row = dbm.PgxPool.QueryRow(ctx, querySQL, schema, table)
+	} else {
+		querySQL = "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = $1)"
+		row = dbm.PgxPool.QueryRow(ctx, querySQL, table)
+	}
 	var exists bool
-	err := row.Scan(&exists)
-	if err != nil {
-		return false, err
+	if err := row.Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check if table exists: %w", err)
 	}
 	return exists, nil
 }
 
-func (dbm *databaseMigrator) createSchema(schema string) error {
-	_, err := dbm.PgxPool.Exec(context.Background(), "CREATE SCHEMA IF NOT EXISTS "+schema)
-	if err != nil {
-		return err
+func (dbm *databaseMigrator) createSchema(ctx context.Context, schema string) error {
+	ident := pgx.Identifier{schema}.Sanitize()
+	if _, err := dbm.PgxPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", ident)); err != nil {
+		return fmt.Errorf("failed to create schema %s: %w", schema, err)
 	}
 	return nil
 }
 
-func (dbm *databaseMigrator) createChangelogTable() error {
-	tx, err := dbm.PgxPool.Begin(context.Background())
+func (dbm *databaseMigrator) createChangelogTable(ctx context.Context) error {
+	tx, err := dbm.PgxPool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback(context.Background())
-			panic(p)
-		}
+		_ = tx.Rollback(ctx)
 	}()
-	script := `
- 		CREATE SCHEMA IF NOT EXISTS {SCHEMA};
-		CREATE TABLE IF NOT EXISTS {SCHEMA_TABLE}
-		(
-			id TEXT PRIMARY KEY NOT NULL,
-			name TEXT NOT NULL,
-			filename TEXT NOT NULL,
-			status TEXT NOT NULL,
-			timestamp TIMESTAMPTZ NOT NULL
-		);
-	`
-	_, err = tx.Exec(context.Background(), dbm.replaceEnv(script))
-	if err != nil {
-		return err
+
+	if dbm.Configuration.ChangelogSchema != "" {
+		schemaIdent := pgx.Identifier{dbm.Configuration.ChangelogSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaIdent)); err != nil {
+			return fmt.Errorf("failed to create changelog schema: %w", err)
+		}
 	}
-	err = tx.Commit(context.Background())
-	if err != nil {
-		return err
+
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id TEXT PRIMARY KEY NOT NULL,
+		name TEXT NOT NULL,
+		filename TEXT NOT NULL,
+		status TEXT NOT NULL,
+		timestamp TIMESTAMPTZ NOT NULL
+	)`, dbm.Configuration.schemaTable())
+
+	if _, err := tx.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to create changelog table: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit changelog table creation: %w", err)
 	}
 	return nil
 }
 
-func (dbm *databaseMigrator) replaceEnv(s string) string {
-	s = strings.ReplaceAll(s, "{SCHEMA_TABLE}", dbm.Configuration.schemaTable())
-	s = strings.ReplaceAll(s, "{SCHEMA}", dbm.Configuration.ChangelogSchema)
-	return s
-}
-
-func DoInTransaction[R any](pool *pgxpool.Pool, fn func(tx pgx.Tx) (*R, error)) (*R, error) {
-	tx, err := pool.Begin(context.Background())
+// DoInTransaction executes fn within a database transaction with context support.
+// If fn returns an error, the transaction is rolled back; otherwise it is committed.
+func DoInTransaction[R any](ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) (R, error)) (R, error) {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		var zero R
+		return zero, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func(tx pgx.Tx, ctx context.Context) {
+	defer func() {
 		_ = tx.Rollback(ctx)
-	}(tx, context.Background())
+	}()
+
 	result, err := fn(tx)
 	if err != nil {
-		return nil, err
+		var zero R
+		return zero, err
 	}
-	err = tx.Commit(context.Background())
-	if err != nil {
-		return nil, err
+
+	if err := tx.Commit(ctx); err != nil {
+		var zero R
+		return zero, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return result, nil
 }
 
-func DoInTransactionNoResult(pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
-	tx, err := pool.Begin(context.Background())
+// DoInTransactionNoResult executes fn within a database transaction without returning a result.
+// If fn returns an error, the transaction is rolled back; otherwise it is committed.
+func DoInTransactionNoResult(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func(tx pgx.Tx, ctx context.Context) {
+	defer func() {
 		_ = tx.Rollback(ctx)
-	}(tx, context.Background())
-	err = fn(tx)
-	if err != nil {
+	}()
+
+	if err := fn(tx); err != nil {
 		return err
 	}
-	err = tx.Commit(context.Background())
-	if err != nil {
-		return err
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return nil
 }
