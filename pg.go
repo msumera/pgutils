@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -68,6 +67,21 @@ const (
 	EnvMigrationsDirectory        = "DB_MIGRATIONS_DIRECTORY"
 	EnvMigrationsDirectoryDefault = "db"
 
+	EnvDatabaseMinConns        = "DB_MIN_CONNS"
+	EnvDatabaseMinConnsDefault = 0
+
+	EnvDatabaseMaxConns        = "DB_MAX_CONNS"
+	EnvDatabaseMaxConnsDefault = 0
+
+	EnvDatabaseMaxConnLifetime        = "DB_MAX_CONN_LIFETIME"
+	EnvDatabaseMaxConnLifetimeDefault = time.Duration(0)
+
+	EnvDatabaseMaxConnIdleTime        = "DB_MAX_CONN_IDLE_TIME"
+	EnvDatabaseMaxConnIdleTimeDefault = time.Duration(0)
+
+	EnvDatabaseHealthCheckPeriod        = "DB_HEALTH_CHECK_PERIOD"
+	EnvDatabaseHealthCheckPeriodDefault = time.Duration(0)
+
 	StatusCompleted MigrationStatus = "COMPLETED"
 	StatusError     MigrationStatus = "ERROR"
 	StatusNew       MigrationStatus = "NEW"
@@ -104,10 +118,19 @@ type Configuration struct {
 	SslCert         string
 	SslKey          string
 
+	// Pool configuration settings
+	MinConns          int32
+	MaxConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
+
+	// Migration settings
 	MigrationsEnabled   bool
 	ChangelogSchema     string
 	ChangelogTable      string
 	MigrationsDirectory string
+	MigrationsFS        fs.FS
 }
 
 // CreateConfigurationFromEnv creates a Configuration by reading environment variables
@@ -127,6 +150,41 @@ func CreateConfigurationFromEnv() Configuration {
 		}
 	}
 
+	var minConns int32
+	if val, ok := os.LookupEnv(EnvDatabaseMinConns); ok {
+		if parsed, err := strconv.ParseInt(val, 10, 32); err == nil {
+			minConns = int32(parsed)
+		}
+	}
+
+	var maxConns int32
+	if val, ok := os.LookupEnv(EnvDatabaseMaxConns); ok {
+		if parsed, err := strconv.ParseInt(val, 10, 32); err == nil {
+			maxConns = int32(parsed)
+		}
+	}
+
+	var maxConnLifetime time.Duration
+	if val, ok := os.LookupEnv(EnvDatabaseMaxConnLifetime); ok {
+		if parsed, err := time.ParseDuration(val); err == nil {
+			maxConnLifetime = parsed
+		}
+	}
+
+	var maxConnIdleTime time.Duration
+	if val, ok := os.LookupEnv(EnvDatabaseMaxConnIdleTime); ok {
+		if parsed, err := time.ParseDuration(val); err == nil {
+			maxConnIdleTime = parsed
+		}
+	}
+
+	var healthCheckPeriod time.Duration
+	if val, ok := os.LookupEnv(EnvDatabaseHealthCheckPeriod); ok {
+		if parsed, err := time.ParseDuration(val); err == nil {
+			healthCheckPeriod = parsed
+		}
+	}
+
 	return Configuration{
 		Address:             getEnv(EnvDatabaseAddress, EnvDatabaseAddressDefault),
 		Username:            getEnv(EnvDatabaseUsername, EnvDatabaseUsernameDefault),
@@ -138,6 +196,11 @@ func CreateConfigurationFromEnv() Configuration {
 		SslRootCert:         getEnv(EnvDatabaseSslRootCert, EnvDatabaseSslRootCertDefault),
 		SslCert:             getEnv(EnvDatabaseSslCert, EnvDatabaseSslCertDefault),
 		SslKey:              getEnv(EnvDatabaseSslKey, EnvDatabaseSslKeyDefault),
+		MinConns:            minConns,
+		MaxConns:            maxConns,
+		MaxConnLifetime:     maxConnLifetime,
+		MaxConnIdleTime:     maxConnIdleTime,
+		HealthCheckPeriod:   healthCheckPeriod,
 		MigrationsEnabled:   migrationsEnabled,
 		ChangelogSchema:     getEnv(EnvChangelogSchema, EnvChangelogSchemaDefault),
 		ChangelogTable:      getEnv(EnvChangelogTable, EnvChangelogTableDefault),
@@ -200,6 +263,21 @@ func ConnectWithConfigContext(ctx context.Context, c Configuration) (*pgxpool.Po
 	if c.Schema != "" {
 		config.ConnConfig.RuntimeParams["search_path"] = c.Schema
 	}
+	if c.MinConns > 0 {
+		config.MinConns = c.MinConns
+	}
+	if c.MaxConns > 0 {
+		config.MaxConns = c.MaxConns
+	}
+	if c.MaxConnLifetime > 0 {
+		config.MaxConnLifetime = c.MaxConnLifetime
+	}
+	if c.MaxConnIdleTime > 0 {
+		config.MaxConnIdleTime = c.MaxConnIdleTime
+	}
+	if c.HealthCheckPeriod > 0 {
+		config.HealthCheckPeriod = c.HealthCheckPeriod
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -214,6 +292,37 @@ func ConnectWithConfigContext(ctx context.Context, c Configuration) (*pgxpool.Po
 		}
 	}
 	return pool, nil
+}
+
+// Ping checks if the database is reachable through the pool.
+func Ping(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return errors.New("pool is nil")
+	}
+	return pool.Ping(ctx)
+}
+
+// HealthCheck verifies pool connectivity and returns basic statistics.
+func HealthCheck(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Stat, error) {
+	if err := Ping(ctx, pool); err != nil {
+		return nil, err
+	}
+	return pool.Stat(), nil
+}
+
+// Migrate applies migrations on the given pool using the provided Configuration.
+func Migrate(ctx context.Context, pool *pgxpool.Pool, c Configuration) error {
+	if pool == nil {
+		return errors.New("pool is nil")
+	}
+	dm := createDatabaseMigrator(pool, c)
+	return dm.Migrate(ctx)
+}
+
+// MigrateFS applies migrations on the given pool using the provided fs.FS filesystem and Configuration.
+func MigrateFS(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, c Configuration) error {
+	c.MigrationsFS = fsys
+	return Migrate(ctx, pool, c)
 }
 
 type databaseMigrator struct {
@@ -295,6 +404,13 @@ func formatMigrationID(id []int) string {
 	return strings.Join(parts, ".")
 }
 
+func (dbm *databaseMigrator) getFS() fs.FS {
+	if dbm.Configuration.MigrationsFS != nil {
+		return dbm.Configuration.MigrationsFS
+	}
+	return os.DirFS(dbm.Configuration.MigrationsDirectory)
+}
+
 func (dbm *databaseMigrator) applyMigration(ctx context.Context, m migration, tx pgx.Tx) error {
 	slog.Info("Applying migration", "filename", m.Filename)
 	id := formatMigrationID(m.ID)
@@ -307,8 +423,8 @@ func (dbm *databaseMigrator) applyMigration(ctx context.Context, m migration, tx
 		return nil
 	}
 
-	filePath := filepath.Join(dbm.Configuration.MigrationsDirectory, m.Filename)
-	bytes, err := os.ReadFile(filePath)
+	fsys := dbm.getFS()
+	bytes, err := fs.ReadFile(fsys, m.Filename)
 	if err != nil {
 		slog.Error("Error reading migration file", "filename", m.Filename, "error", err)
 		return fmt.Errorf("failed to read migration file %s: %w", m.Filename, err)
@@ -355,14 +471,14 @@ func (dbm *databaseMigrator) updateMigrationStatus(ctx context.Context, id strin
 }
 
 func (dbm *databaseMigrator) getMigrations() ([]migration, error) {
-	migrationsDir := dbm.Configuration.MigrationsDirectory
-	entries, err := os.ReadDir(migrationsDir)
+	fsys := dbm.getFS()
+	entries, err := fs.ReadDir(fsys, ".")
 	if errors.Is(err, fs.ErrNotExist) {
 		slog.Warn("Directory does not exist", "directory", dbm.Configuration.MigrationsDirectory)
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to read migrations directory %s: %w", migrationsDir, err)
+		return nil, fmt.Errorf("failed to read migrations directory: %w", err)
 	}
 
 	var migrations []migration
@@ -504,7 +620,17 @@ func (dbm *databaseMigrator) createChangelogTable(ctx context.Context) error {
 // DoInTransaction executes fn within a database transaction with context support.
 // If fn returns an error, the transaction is rolled back; otherwise it is committed.
 func DoInTransaction[R any](ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) (R, error)) (R, error) {
-	tx, err := pool.Begin(ctx)
+	return DoInTransactionWithOpts(ctx, pool, pgx.TxOptions{}, fn)
+}
+
+// DoInTransactionWithOpts executes fn within a database transaction with custom pgx.TxOptions.
+// If fn returns an error, the transaction is rolled back; otherwise it is committed.
+func DoInTransactionWithOpts[R any](ctx context.Context, pool *pgxpool.Pool, opts pgx.TxOptions, fn func(tx pgx.Tx) (R, error)) (R, error) {
+	if pool == nil {
+		var zero R
+		return zero, errors.New("pool is nil")
+	}
+	tx, err := pool.BeginTx(ctx, opts)
 	if err != nil {
 		var zero R
 		return zero, fmt.Errorf("failed to begin transaction: %w", err)
@@ -529,7 +655,16 @@ func DoInTransaction[R any](ctx context.Context, pool *pgxpool.Pool, fn func(tx 
 // DoInTransactionNoResult executes fn within a database transaction without returning a result.
 // If fn returns an error, the transaction is rolled back; otherwise it is committed.
 func DoInTransactionNoResult(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
-	tx, err := pool.Begin(ctx)
+	return DoInTransactionNoResultWithOpts(ctx, pool, pgx.TxOptions{}, fn)
+}
+
+// DoInTransactionNoResultWithOpts executes fn within a database transaction with custom pgx.TxOptions without returning a result.
+// If fn returns an error, the transaction is rolled back; otherwise it is committed.
+func DoInTransactionNoResultWithOpts(ctx context.Context, pool *pgxpool.Pool, opts pgx.TxOptions, fn func(tx pgx.Tx) error) error {
+	if pool == nil {
+		return errors.New("pool is nil")
+	}
+	tx, err := pool.BeginTx(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}

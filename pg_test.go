@@ -268,6 +268,11 @@ func TestCreateConfigurationFromEnv(t *testing.T) {
 	t.Setenv(EnvDatabaseUsername, "custom_user")
 	t.Setenv(EnvMigrationsEnabled, "false")
 	t.Setenv(EnvDatabaseSslMode, "require")
+	t.Setenv(EnvDatabaseMinConns, "5")
+	t.Setenv(EnvDatabaseMaxConns, "25")
+	t.Setenv(EnvDatabaseMaxConnLifetime, "1h")
+	t.Setenv(EnvDatabaseMaxConnIdleTime, "15m")
+	t.Setenv(EnvDatabaseHealthCheckPeriod, "30s")
 
 	cfg2 := CreateConfigurationFromEnv()
 	if cfg2.Address != "customhost:5433" {
@@ -281,6 +286,21 @@ func TestCreateConfigurationFromEnv(t *testing.T) {
 	}
 	if cfg2.SslMode != SSLModeRequire {
 		t.Errorf("expected sslmode require, got %s", cfg2.SslMode)
+	}
+	if cfg2.MinConns != 5 {
+		t.Errorf("expected min conns 5, got %d", cfg2.MinConns)
+	}
+	if cfg2.MaxConns != 25 {
+		t.Errorf("expected max conns 25, got %d", cfg2.MaxConns)
+	}
+	if cfg2.MaxConnLifetime != time.Hour {
+		t.Errorf("expected max conn lifetime 1h, got %v", cfg2.MaxConnLifetime)
+	}
+	if cfg2.MaxConnIdleTime != 15*time.Minute {
+		t.Errorf("expected max conn idle time 15m, got %v", cfg2.MaxConnIdleTime)
+	}
+	if cfg2.HealthCheckPeriod != 30*time.Second {
+		t.Errorf("expected health check period 30s, got %v", cfg2.HealthCheckPeriod)
 	}
 }
 
@@ -333,10 +353,69 @@ func TestMigrationSortingAndFiltering(t *testing.T) {
 	}
 }
 
+func TestMigrationWithFS(t *testing.T) {
+	postgres := createContainer(t)
+	defer func() {
+		_ = postgres.Terminate(context.Background())
+	}()
+
+	t.Setenv(EnvMigrationsEnabled, "false")
+	pool, err := Connect()
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	// 1. Test Ping & HealthCheck
+	if err := Ping(ctx, pool); err != nil {
+		t.Fatalf("ping failed: %v", err)
+	}
+
+	stat, err := HealthCheck(ctx, pool)
+	if err != nil {
+		t.Fatalf("health check failed: %v", err)
+	}
+	if stat.TotalConns() < 1 {
+		t.Errorf("expected at least 1 total conn in stat, got %d", stat.TotalConns())
+	}
+
+	// 2. Test MigrateFS using os.DirFS
+	cfg := CreateConfigurationFromEnv()
+	cfg.ChangelogSchema = "fsschema"
+	err = MigrateFS(ctx, pool, os.DirFS("testdb"), cfg)
+	if err != nil {
+		t.Fatalf("MigrateFS failed: %v", err)
+	}
+
+	// Verify table was created by migration
+	var count int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM testtable").Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to query testtable: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 row in testtable, got %d", count)
+	}
+
+	// 3. Test DoInTransactionWithOpts (ReadOnly error on insert)
+	readOnlyOpts := pgx.TxOptions{
+		AccessMode: pgx.ReadOnly,
+	}
+	err = DoInTransactionNoResultWithOpts(ctx, pool, readOnlyOpts, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO testtable (id, name, description) VALUES (999, 'ro', 'ro')")
+		return err
+	})
+	if err == nil {
+		t.Error("expected error when inserting in read-only transaction, got nil")
+	}
+}
+
 func createContainer(t *testing.T) testcontainers.Container {
 	t.Helper()
 	containerRequest := testcontainers.ContainerRequest{
-		Image:        "postgres:17",
+		Image:        "postgres:18",
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
 			"POSTGRES_USER":     "test_user",

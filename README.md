@@ -18,6 +18,68 @@
 | DB_CHANGELOG_SCHEMA     | `public`         | Schema where the migration changelog table is stored                                                   |
 | DB_CHANGELOG_TABLE      | `changelog`      | Name of the table used to track applied migrations                                                     |
 | DB_MIGRATIONS_DIRECTORY | `db`             | Directory containing `.sql` migration files                                                            |
+| DB_MIN_CONNS            | `0`              | Minimum number of connections in the pool                                                              |
+| DB_MAX_CONNS            | `0`              | Maximum number of connections in the pool                                                              |
+| DB_MAX_CONN_LIFETIME    | `0`              | Maximum lifetime duration for connections (e.g., `1h`, `30m`)                                          |
+| DB_MAX_CONN_IDLE_TIME   | `0`              | Maximum idle duration for connections before closure (e.g., `15m`, `5m`)                               |
+| DB_HEALTH_CHECK_PERIOD  | `0`              | Frequency of background health checks on pool connections (e.g., `30s`, `1m`)                          |
+
+## Features and Usage
+
+### Transactions (`DoInTransaction`, `DoInTransactionWithOpts`)
+Execute business operations safely wrapped in a database transaction with automatic rollback on error or panic:
+
+```go
+// Standard transaction
+result, err := pg.DoInTransaction(ctx, pool, func(tx pgx.Tx) (string, error) {
+    // ...
+    return "ok", nil
+})
+
+// Transaction with custom options (e.g., ReadOnly, Serializable)
+err := pg.DoInTransactionNoResultWithOpts(ctx, pool, pgx.TxOptions{
+    AccessMode: pgx.ReadOnly,
+    IsoLevel:   pgx.RepeatableRead,
+}, func(tx pgx.Tx) error {
+    // Read operations
+    return nil
+})
+```
+
+### Embedded Migrations (`embed.FS` / `fs.FS`)
+You can embed SQL migration files directly into your binary using Go `embed`:
+
+```go
+import (
+    "embed"
+    "github.com/msumera/pgutils"
+)
+
+//go:embed db/*.sql
+var migrationFiles embed.FS
+
+// Option A: Configure during pool creation
+cfg := pg.CreateConfigurationFromEnv()
+cfg.MigrationsFS = migrationFiles
+pool, err := pg.ConnectWithConfigContext(ctx, cfg)
+
+// Option B: Run migrations explicitly on an existing pool
+err := pg.MigrateFS(ctx, pool, migrationFiles, cfg)
+```
+
+### Health Check & Ping
+Easily check database connectivity and inspect pool statistics:
+
+```go
+if err := pg.Ping(ctx, pool); err != nil {
+    log.Fatal("database unreachable:", err)
+}
+
+stat, err := pg.HealthCheck(ctx, pool)
+if err == nil {
+    fmt.Printf("Total conns: %d, Idle conns: %d\n", stat.TotalConns(), stat.IdleConns())
+}
+```
 
 ## Migration File Ordering Guide
 
